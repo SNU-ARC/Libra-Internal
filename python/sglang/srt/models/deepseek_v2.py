@@ -14,6 +14,7 @@
 
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 """Inference-only DeepseekV2 model."""
 
 import concurrent.futures
@@ -449,6 +450,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         can_fuse_mlp_allreduce: bool = False,
+        prev_hidden_states: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -458,15 +460,15 @@ class DeepseekV2MoE(nn.Module):
                 and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             ):
                 return self.forward_normal_dual_stream(
-                    hidden_states, can_fuse_mlp_allreduce
+                    hidden_states, can_fuse_mlp_allreduce, prev_hidden_states=prev_hidden_states
                 )
             else:
-                return self.forward_normal(hidden_states, can_fuse_mlp_allreduce)
+                return self.forward_normal(hidden_states, can_fuse_mlp_allreduce, prev_hidden_states=prev_hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(
-        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
+        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False, prev_hidden_states: torch.Tensor = None
     ) -> torch.Tensor:
 
         current_stream = torch.cuda.current_stream()
@@ -478,9 +480,19 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states)
             kwargs = {"hidden_states": hidden_states}
             if self.topk is not None:
-                kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+                expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                )
+                kwargs["topk_output"] = self.topk(hidden_states, router_logits, expert_location_dispatch_info)
+                if prev_hidden_states is not None:
+                    pred_router_logits = self.gate(prev_hidden_states)
+                    assert pred_router_logits.shape[0] == router_logits.shape[0], f"pred: {pred_router_logits.shape[0]} vs real: {router_logits.shape[0]}"
+                    kwargs["pred_topk_output"] = self.topk(hidden_states, pred_router_logits)
+                else:
+                    kwargs["pred_topk_output"] = None
             else:
                 kwargs["router_logits"] = router_logits
+                kwargs["pred_topk_output"] = None
             final_hidden_states = self.experts(**kwargs)
             if not _is_cuda:
                 final_hidden_states *= self.routed_scaling_factor
@@ -491,7 +503,7 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_normal(
-        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False
+        self, hidden_states: torch.Tensor, can_fuse_mlp_allreduce: bool = False, prev_hidden_states: torch.Tensor = None
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -504,8 +516,15 @@ class DeepseekV2MoE(nn.Module):
         kwargs = {"hidden_states": hidden_states}
         if self.topk is not None:
             kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+            if prev_hidden_states is not None:
+                pred_router_logits = self.gate(prev_hidden_states)
+                assert pred_router_logits.shape[0] == router_logits.shape[0], f"pred: {pred_router_logits.shape[0]} vs real: {router_logits.shape[0]}"
+                kwargs["pred_topk_output"] = self.topk(hidden_states, pred_router_logits)
+            else:
+                kwargs["pred_topk_output"] = None
         else:
             kwargs["router_logits"] = router_logits
+            kwargs["pred_topk_output"] = None
         final_hidden_states = self.experts(**kwargs)
         if not _is_cuda and not _use_aiter:
             # fused in biased_grouped_topk so we can skip here
@@ -514,6 +533,9 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1 and not can_fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        self.token_experts_mapping_table = self.experts.token_experts_mapping_table
+        self.baseline_token_experts_mapping_table = self.experts.baseline_token_experts_mapping_table
         return final_hidden_states
 
     def forward_cpu(
@@ -1770,6 +1792,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
+        self.token_experts_mapping_table = None
+        self.baseline_token_experts_mapping_table = None
+
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
 
@@ -1789,6 +1814,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
             )
+
+            self.is_moe = True
         else:
             if enable_moe_dense_fully_dp():
                 mlp_tp_rank, mlp_tp_size = 0, 1
@@ -1803,6 +1830,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
+
+            self.is_moe = False
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1852,6 +1881,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        prev_hiddens_states: Optional[torch.Tensor]
     ) -> torch.Tensor:
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -1885,7 +1915,11 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
-        return hidden_states, residual
+        if self.is_moe:
+            self.token_experts_mapping_table = self.mlp.token_experts_mapping_table
+            self.baseline_token_experts_mapping_table = self.mlp.baseline_token_experts_mapping_table
+
+        return hidden_states, residual, None
 
     def op_comm_prepare_attn(
         self,
@@ -1992,6 +2026,8 @@ class DeepseekV2Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        self.num_prediction_layers = 0
+
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -2002,6 +2038,9 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+
+        self.curr_input_ids = input_ids
+
         total_num_layers = len(self.layers)
         device = input_embeds.device if input_embeds is not None else input_ids.device
         zero_allocator = BumpAllocator(
@@ -2017,6 +2056,9 @@ class DeepseekV2Model(nn.Module):
 
         residual = None
 
+        prev_hidden_states = None
+        prev_hidden_states_1, prev_hidden_states_2 = None, None
+
         normal_num_layers = (
             self.first_k_dense_replace
             if forward_batch.can_run_tbo
@@ -2025,9 +2067,18 @@ class DeepseekV2Model(nn.Module):
         for i in range(normal_num_layers):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, zero_allocator
+                hidden_states, residual, out_prev_hidden_states = layer(
+                    positions, hidden_states, forward_batch, residual, zero_allocator, prev_hidden_states
                 )
+                # Lookahead predictor input of the next layer: the MLP input of the layer
+                # num_prediction_layers (1 or 2) layers before it
+                if self.num_prediction_layers:
+                    prev_hidden_states_2 = prev_hidden_states_1
+                    prev_hidden_states_1 = out_prev_hidden_states
+                    if self.num_prediction_layers == 1:
+                        prev_hidden_states = prev_hidden_states_1
+                    elif self.num_prediction_layers == 2:
+                        prev_hidden_states = prev_hidden_states_2
 
         if normal_num_layers != total_num_layers:
             hidden_states, residual = model_forward_maybe_tbo(

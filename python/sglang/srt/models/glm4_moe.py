@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 
 """Inference-only GLM-4.5 model compatible with HuggingFace weights"""
 
@@ -157,7 +158,7 @@ class Glm4MoeMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch=None, can_fuse_mlp_allreduce=False):
+    def forward(self, x, forward_batch=None, can_fuse_mlp_allreduce=False, prev_hidden_states: Optional[torch.Tensor] = None):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
@@ -399,6 +400,9 @@ class Glm4MoeSparseMoeBlock(DeepseekV2MoE):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
 
+        self.token_experts_mapping_table = None
+        self.baseline_token_experts_mapping_table = None
+
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -619,6 +623,10 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
+        self.token_experts_mapping_table = None
+        self.baseline_token_experts_mapping_table = None
+        self.prev_hidden_state = None
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -626,6 +634,7 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        prev_hidden_states: Optional[torch.Tensor],
     ) -> torch.Tensor:
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
@@ -641,13 +650,20 @@ class Glm4MoeDecoderLayer(DeepseekV2DecoderLayer):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        # MLP input of this layer; the lookahead predictor applies a later layer's gate to it
+        out_prev_hidden_states = hidden_states.detach().clone()
+
+        hidden_states = self.mlp(hidden_states, forward_batch, prev_hidden_states=prev_hidden_states)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
 
-        return hidden_states, residual
+        if self.is_layer_sparse:
+            self.token_experts_mapping_table = self.mlp.token_experts_mapping_table
+            self.baseline_token_experts_mapping_table = self.mlp.baseline_token_experts_mapping_table
+
+        return hidden_states, residual, out_prev_hidden_states
 
 
 class Glm4MoeModel(DeepseekV2Model):
@@ -683,6 +699,9 @@ class Glm4MoeModel(DeepseekV2Model):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.dp_size = get_local_attention_dp_size()
+
+        self.curr_input_ids = None
+        self.num_prediction_layers = 0
 
 
 class Glm4MoeForCausalLM(DeepseekV2ForCausalLM):

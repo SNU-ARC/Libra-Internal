@@ -14,6 +14,7 @@
 
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/qwen2_moe.py
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
@@ -71,6 +72,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import add_prefix, make_layers
+
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +136,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {config.num_experts}."
             )
+
+        self.token_experts_mapping_table = None
+        self.baseline_token_experts_mapping_table = None
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -191,10 +200,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        final_hidden_states = self.experts(hidden_states, topk_output, None)
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        self.token_experts_mapping_table = self.experts.token_experts_mapping_table
+        self.baseline_token_experts_mapping_table = self.experts.baseline_token_experts_mapping_table
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -322,6 +334,9 @@ class Qwen2MoeDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
 
+        self.token_experts_mapping_table = None
+        self.baseline_token_experts_mapping_table = None
+
         self.layer_id = layer_id
 
         self.attn_tp_size = get_attention_tp_size()
@@ -346,6 +361,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
+
+            self.is_moe = True
         else:
             self.mlp = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
@@ -354,6 +371,8 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
+
+            self.is_moe = False
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -370,6 +389,7 @@ class Qwen2MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        prev_hidden_states: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -393,7 +413,11 @@ class Qwen2MoeDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        return hidden_states, residual
+        if self.is_moe:
+            self.token_experts_mapping_table = self.mlp.token_experts_mapping_table
+            self.baseline_token_experts_mapping_table = self.mlp.baseline_token_experts_mapping_table
+
+        return hidden_states, residual, None
 
 
 class Qwen2MoeModel(nn.Module):
@@ -410,6 +434,9 @@ class Qwen2MoeModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_size = get_tensor_model_parallel_world_size()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -444,6 +471,9 @@ class Qwen2MoeModel(nn.Module):
         # For EAGLE3 support
         self.layers_to_capture = []
 
+        self.curr_input_ids = None
+        self.num_prediction_layers = 0
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -451,7 +481,11 @@ class Qwen2MoeModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        correctness_check: bool = False,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+
+        self.curr_input_ids = input_ids
+
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -462,6 +496,9 @@ class Qwen2MoeModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+
+        prev_hidden_states = None
+        prev_hidden_states_1, prev_hidden_states_2 = None, None
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -484,9 +521,48 @@ class Qwen2MoeModel(nn.Module):
                     )
                 with get_global_expert_distribution_recorder().with_current_layer(i):
                     layer = self.layers[i]
-                    hidden_states, residual = layer(
-                        positions, hidden_states, forward_batch, residual
+
+                    hidden_states, residual, out_prev_hidden_states = layer(
+                        positions, hidden_states, forward_batch, residual, prev_hidden_states
                     )
+
+                    if correctness_check and prev_hidden_states is not None:
+                        pred_router_logits, _ = layer.mlp.gate(prev_hidden_states)
+                        pred_topk_output = layer.mlp.topk(hidden_states, pred_router_logits)
+                        pred_topk_weights = pred_topk_output.topk_weights
+                        pred_topk_ids = pred_topk_output.topk_ids
+                        topk_ids_cpu = pred_topk_ids.cpu().tolist()
+                        topk_weights_cpu = pred_topk_weights.cpu().tolist()
+                        # sort topk ids by weights
+                        token_experts_mapping_tables_cmp = [
+                            [i for _, i in sorted(zip(weights, ids), reverse=True)]
+                            for ids, weights in zip(topk_ids_cpu, topk_weights_cpu)
+                        ]
+
+                        assert layer.mlp.token_experts_mapping_table is not None
+                        assert len(layer.mlp.token_experts_mapping_table) == len(token_experts_mapping_tables_cmp)
+                        assert len(layer.mlp.token_experts_mapping_table[0]) == len(token_experts_mapping_tables_cmp[0])
+
+                        wrong_idx = [
+                            i for i in range(len(layer.mlp.token_experts_mapping_table))
+                            if not torch.equal(torch.tensor(layer.mlp.token_experts_mapping_table[i]), torch.tensor(token_experts_mapping_tables_cmp[i]))
+                        ]
+                        wrong_token_experts_mapping_tables = torch.tensor(layer.mlp.token_experts_mapping_table)[wrong_idx]
+                        true_token_experts_mapping_tables = torch.tensor(token_experts_mapping_tables_cmp)[wrong_idx]
+
+                        if self.tp_rank == 0:
+                            logger.info(f"wrong_token_experts_mapping_tables({wrong_token_experts_mapping_tables.shape}): {wrong_token_experts_mapping_tables}")
+                            logger.info(f"true_token_experts_mapping_tables({true_token_experts_mapping_tables.shape}): {true_token_experts_mapping_tables}")
+
+                    # Lookahead predictor input of the next layer: the MLP input of the layer
+                    # num_prediction_layers (1 or 2) layers before it
+                    if self.num_prediction_layers:
+                        prev_hidden_states_2 = prev_hidden_states_1
+                        prev_hidden_states_1 = out_prev_hidden_states
+                        if self.num_prediction_layers == 1:
+                            prev_hidden_states = prev_hidden_states_1
+                        elif self.num_prediction_layers == 2:
+                            prev_hidden_states = prev_hidden_states_2
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {

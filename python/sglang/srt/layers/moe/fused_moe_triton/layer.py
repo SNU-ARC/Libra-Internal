@@ -1,4 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 
 import logging
 from enum import Enum
@@ -158,6 +159,9 @@ class FusedMoE(torch.nn.Module):
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
         )
+
+        self.token_experts_mapping_table = None
+        self.baseline_token_experts_mapping_table = None
 
     def _load_per_tensor_weight_scale(
         self,
@@ -608,13 +612,38 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput):
+    def forward(self, hidden_states: torch.Tensor, topk_output: StandardTopKOutput, pred_topk_output: Optional[StandardTopKOutput]):
         assert self.quant_method is not None
+
+        # Libra TEMT: keep the logical expert ids (before expert_map_gpu) for the TEMT dump
+        topk_output_orig = topk_output
 
         if self.expert_map_gpu is not None:
             topk_output = topk_output._replace(
                 topk_ids=self.expert_map_gpu[topk_output.topk_ids]
             )
+
+        # TEMT rows of this layer: token_experts_mapping_table holds the predicted ids sorted by weight
+        # (or the real ids if there is no prediction), baseline_token_experts_mapping_table the real ids
+        if pred_topk_output is not None:
+            pred_topk_weights = pred_topk_output.topk_weights
+            pred_topk_ids = pred_topk_output.topk_ids
+            topk_ids_cpu = pred_topk_ids.cpu().tolist()
+            topk_weights_cpu = pred_topk_weights.cpu().tolist()
+            # sort topk ids by weights
+            topk_ids_cpu = [
+                [i for _, i in sorted(zip(weights, ids), reverse=True)]
+                for ids, weights in zip(topk_ids_cpu, topk_weights_cpu)
+            ]
+            baseline_topk_ids = topk_output_orig.topk_ids
+            baseline_topk_ids_cpu = baseline_topk_ids.cpu().tolist()
+        else:
+            topk_ids = topk_output_orig.topk_ids
+            topk_ids_cpu = topk_ids.cpu().tolist()
+            baseline_topk_ids = topk_output_orig.topk_ids
+            baseline_topk_ids_cpu = baseline_topk_ids.cpu().tolist()
+        self.token_experts_mapping_table = topk_ids_cpu
+        self.baseline_token_experts_mapping_table = baseline_topk_ids_cpu
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(

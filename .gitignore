@@ -235,3 +235,20 @@ compile_commands.json
 Cargo.lock
 
 lmms-eval
+
+pytorch-profiles
+figures
+expt_load_imbalance_data
+expt_temt_data
+expt_token2expert_data
+profile_log
+
+expt_token2expert_results*
+prefetch_rebalance/result2
+
+# Libra: local build outputs of the Cython planner (python setup.py build_ext --inplace)
+# and per-run logs of prefetch_rebalance/evaluate_fluctuation_libra_4096.sh
+prefetch_rebalance/*.c
+prefetch_rebalance/*.so
+prefetch_rebalance/build/
+prefetch_rebalance/log_*.txt

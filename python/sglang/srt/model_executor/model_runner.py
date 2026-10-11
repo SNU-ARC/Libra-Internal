@@ -11,6 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 """ModelRunner runs the forward passes of the models."""
 
 import datetime
@@ -1674,7 +1675,7 @@ class ModelRunner:
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.post_forward_mlp_sync_batch(ret)
 
-        return ret, can_run_cuda_graph
+        return ret
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

@@ -1,3 +1,4 @@
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 from __future__ import annotations
 
 import logging
@@ -156,11 +157,11 @@ class EPMoE(FusedMoE):
             self.block_shape = None
             self.activation_scheme = None
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, pred_topk_output: Optional[TopKOutput]):
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
             return self.forward_deepgemm(hidden_states, topk_output)
         else:
-            return super().forward(hidden_states, topk_output)
+            return super().forward(hidden_states, topk_output, pred_topk_output)
 
     def forward_deepgemm(
         self,

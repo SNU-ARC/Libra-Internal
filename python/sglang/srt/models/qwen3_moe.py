@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+# Modified from SGLang v0.4.10 (https://github.com/sgl-project/sglang) for Libra (ICLR 2026).
 
 
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
@@ -97,6 +98,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
+        self.token_experts_mapping_table = None
+        self.baseline_token_experts_mapping_table = None
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
@@ -145,11 +149,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.top_k = config.num_experts_per_tok
 
     def forward(
-        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None, prev_hidden_states: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
 
         if not global_server_args_dict["enable_deepep_moe"]:
-            return self.forward_normal(hidden_states)
+            return self.forward_normal(hidden_states, prev_hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
@@ -160,16 +164,39 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             if name not in ["correction_bias"]
         ]
 
-    def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_normal(self, hidden_states: torch.Tensor, prev_hidden_states: Optional[torch.Tensor] = None) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+
+        if prev_hidden_states is not None:
+            pred_router_logits, _ = self.gate(prev_hidden_states)
+            assert pred_router_logits.shape[0] == router_logits.shape[0], f"pred: {pred_router_logits.shape[0]} vs real: {router_logits.shape[0]}"
+        else:
+            pred_router_logits = None
+
+        expert_location_dispatch_info = ExpertLocationDispatchInfo.init_new(
+            layer_id=self.layer_id,
+        )
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=expert_location_dispatch_info
+        )
+
+        if pred_router_logits is not None:
+            pred_topk_output = self.topk(hidden_states, pred_router_logits)
+        else:
+            pred_topk_output = None
+
+        final_hidden_states = self.experts(hidden_states, topk_output, pred_topk_output)
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        self.token_experts_mapping_table = self.experts.token_experts_mapping_table
+        self.baseline_token_experts_mapping_table = self.experts.baseline_token_experts_mapping_table
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -475,6 +502,10 @@ class Qwen3MoeDecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
+        self.token_experts_mapping_table = None
+        self.baseline_token_experts_mapping_table = None
+        self.prev_hidden_state = None
+
         self.layer_id = layer_id
 
         self.attn_tp_size = get_attention_tp_size()
@@ -499,6 +530,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
+
+            self.is_moe = True
         else:
             self.mlp = Qwen3MoeMLP(
                 hidden_size=config.hidden_size,
@@ -507,6 +540,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
+
+            self.is_moe = False
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -524,6 +559,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        prev_hidden_states: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -541,13 +577,20 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        # MLP input of this layer; the lookahead predictor applies a later layer's gate to it
+        out_prev_hidden_states = hidden_states.detach().clone()
+
+        hidden_states = self.mlp(hidden_states, forward_batch, prev_hidden_states)
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
 
-        return hidden_states, residual
+        if self.is_moe:
+            self.token_experts_mapping_table = self.mlp.token_experts_mapping_table
+            self.baseline_token_experts_mapping_table = self.mlp.baseline_token_experts_mapping_table
+
+        return hidden_states, residual, out_prev_hidden_states
 
     def op_comm_prepare_attn(
         self,
